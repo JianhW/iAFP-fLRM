@@ -1,0 +1,509 @@
+import sys, os, re
+
+from transformers import AutoTokenizer, AutoModel
+
+pPath = os.path.split(os.path.realpath(sys.argv[0]))[0]
+sys.path.append(pPath)
+pPath = re.sub(r'codes$', '', os.path.split(os.path.realpath(sys.argv[0]))[0])
+sys.path.append(pPath)
+import pickle
+import math
+from collections import Counter
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.utils.data as Data
+import torch.nn.utils.rnn as rnn_utils
+import time
+from termcolor import colored
+from sklearn.metrics import auc, roc_curve, precision_recall_curve, average_precision_score
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
+import pandas as pd
+from sklearn.decomposition import TruncatedSVD
+device=torch.device("cuda:0")
+def load_bench_data(file):#训练集
+    tmp = pd.read_csv(file, header=None)
+    seqs, labels = tmp[0].values.tolist(), tmp[1].values.tolist()
+    data_iter = data_construct(seqs, labels, file,train=True)
+    data_iter = list(data_iter)
+    return data_iter
+def load_Ind_data(file):#独立测试集
+    tmp = pd.read_csv(file, header=None)
+    seqs, labels = tmp[0].values.tolist(), tmp[1].values.tolist()
+    data_iter = data_construct(seqs, labels, file,train=True)
+    data_iter = list(data_iter)
+    return data_iter
+def data_construct(seqs, labels,file, train):#将氨基酸序列转化为模型所需要的输入
+
+    model_name = "C:/Users/chengjianwei/Desktop/大创/deep_learning/trans"  # 可选：roberta-base, distilbert-base-uncased等
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    longest_num = len(max(seqs, key=len))
+    sequences = [i.ljust(longest_num, 'X') for i in seqs]  # 以最长的氨基酸序列为基准，对其他长度不足的氨基酸序列进行填充
+    trans_codes = []
+    for pep in seqs:
+        inputs = tokenizer(pep, return_tensors="pt", padding=True, truncation=True)
+        with torch.no_grad():  # 禁用梯度计算
+            outputs = model(**inputs)
+        last_hidden_states = outputs.last_hidden_state  # [batch_size, seq_len, hidden_dim]
+        trans_codes.append(last_hidden_states[:, 0, :].to(device))
+
+    dataset = Data.TensorDataset( torch.FloatTensor([item.cpu().detach().numpy() for item in trans_codes]).cuda(),
+                                 torch.LongTensor(labels))
+    # print(dataset.shape)
+    batch_size = 128
+    data_iter = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=train)
+    if (file == 'Ind.csv'):
+        save_data = {
+            'dataset': dataset,  # 保存整个数据集对象
+            'loader_args': {
+                'batch_size': data_iter.batch_size,
+                'num_workers': data_iter.num_workers,
+            }
+        }
+        # 使用pickle保存
+        with open('trans_test_loader_config.pkl', 'wb') as f:
+            pickle.dump(save_data, f)
+    return data_iter
+
+
+
+def BLOSUM62(seqs):
+    """
+    BLOSUM 是“blocks substitution matrix”的缩写。它是目前常用的一种氨基酸替换打分矩阵
+    需要等长的氨基酸序列
+    """
+    blosum62 = {
+        'A': [4,  -1, -2, -2, 0,  -1, -1, 0, -2,  -1, -1, -1, -1, -2, -1, 1,  0,  -3, -2, 0],  # A
+        'R': [-1, 5,  0,  -2, -3, 1,  0,  -2, 0,  -3, -2, 2,  -1, -3, -2, -1, -1, -3, -2, -3], # R
+        'N': [-2, 0,  6,  1,  -3, 0,  0,  0,  1,  -3, -3, 0,  -2, -3, -2, 1,  0,  -4, -2, -3], # N
+        'D': [-2, -2, 1,  6,  -3, 0,  2,  -1, -1, -3, -4, -1, -3, -3, -1, 0,  -1, -4, -3, -3], # D
+        'C': [0,  -3, -3, -3, 9,  -3, -4, -3, -3, -1, -1, -3, -1, -2, -3, -1, -1, -2, -2, -1], # C
+        'Q': [-1, 1,  0,  0,  -3, 5,  2,  -2, 0,  -3, -2, 1,  0,  -3, -1, 0,  -1, -2, -1, -2], # Q
+        'E': [-1, 0,  0,  2,  -4, 2,  5,  -2, 0,  -3, -3, 1,  -2, -3, -1, 0,  -1, -3, -2, -2], # E
+        'G': [0,  -2, 0,  -1, -3, -2, -2, 6,  -2, -4, -4, -2, -3, -3, -2, 0,  -2, -2, -3, -3], # G
+        'H': [-2, 0,  1,  -1, -3, 0,  0,  -2, 8,  -3, -3, -1, -2, -1, -2, -1, -2, -2, 2,  -3], # H
+        'I': [-1, -3, -3, -3, -1, -3, -3, -4, -3, 4,  2,  -3, 1,  0,  -3, -2, -1, -3, -1, 3],  # I
+        'L': [-1, -2, -3, -4, -1, -2, -3, -4, -3, 2,  4,  -2, 2,  0,  -3, -2, -1, -2, -1, 1],  # L
+        'K': [-1, 2,  0,  -1, -3, 1,  1,  -2, -1, -3, -2, 5,  -1, -3, -1, 0,  -1, -3, -2, -2], # K
+        'M': [-1, -1, -2, -3, -1, 0,  -2, -3, -2, 1,  2,  -1, 5,  0,  -2, -1, -1, -1, -1, 1],  # M
+        'F': [-2, -3, -3, -3, -2, -3, -3, -3, -1, 0,  0,  -3, 0,  6,  -4, -2, -2, 1,  3,  -1], # F
+        'P': [-1, -2, -2, -1, -3, -1, -1, -2, -2, -3, -3, -1, -2, -4, 7,  -1, -1, -4, -3, -2], # P
+        'S': [1,  -1, 1,  0,  -1, 0,  0,  0,  -1, -2, -2, 0,  -1, -2, -1, 4,  1,  -3, -2, -2], # S
+        'T': [0,  -1, 0,  -1, -1, -1, -1, -2, -2, -1, -1, -1, -1, -2, -1, 1,  5,  -2, -2, 0],  # T
+        'W': [-3, -3, -4, -4, -2, -2, -3, -2, -2, -3, -2, -3, -1, 1,  -4, -3, -2, 11, 2,  -3], # W
+        'Y': [-2, -2, -2, -3, -2, -1, -2, -3, 2,  -1, -1, -2, -1, 3,  -3, -2, -2, 2,  7,  -1], # Y
+        'V': [0,  -3, -3, -3, -1, -2, -2, -3, -3, 3,  1,  -2, 1,  -1, -2, -2, 0,  -3, -1, 4],  # V
+        'X': [0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],  # X
+    }
+    encodings = []
+    for seq in seqs:
+        code = []
+        for aa in seq:
+            code += blosum62[aa]
+        encodings.append(code)
+    return encodings
+
+def position_encoding(labels,seqs):#位置编码，transformer模型的步骤之一
+    d = 128
+    b = 1000
+    res = []
+    for seq in seqs:
+        N = len(seq)
+        value = []
+        for pos in range(N):
+            tmp = []
+            for i in range(d // 2):
+                tmp.append(pos / (b ** (2 * i / d)))
+            value.append(tmp)
+        value = np.array(value)
+        pos_encoding = np.zeros((N, d))
+        pos_encoding[:, 0::2] = np.sin(value[:, :])
+        pos_encoding[:, 1::2] = np.cos(value[:, :])
+        res.append(pos_encoding)
+    return np.array(res)
+'''
+    res=torch.tensor(res,dtype=torch.float)
+
+    #print(res.shape)
+    res_2d = res.mean(dim= 1)
+    linear_layer1 = nn.Linear(res_2d.size(-1), 256)
+    res_2d=linear_layer1(res_2d)
+    #print(res_2d.shape)
+    pca_TSNE(res_2d,labels,n_components=200)
+'''
+
+def HF_encoding(seqs, sequences,labels):
+    embed_dim = 256
+    num_heads = 8
+    dropout = 0.1
+    d_model=256
+    multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+    result = BLOSUM62(sequences)
+    result= torch.tensor(result)
+    #print(result.shape)
+    linear_layer1=nn.Linear(result.size(-1),d_model)
+    result=linear_layer1(result.float())
+    #result,_=multihead_attn(result,result,result)
+    #print(result.shape)
+    #pca_TSNE(result,labels)
+    #print(result.shape)
+    return result
+
+class Net3(nn.Module):
+    def __init__(self,num_classes=2):
+        super(Net3, self).__init__()
+        self.conv_hidden_dim = 64
+        self.lstm_hidden_dim=32
+        self.MLP_embed_dim = 64
+        self.MLP_hidden_dim = 64
+        self.dropout=0.2
+        self.batch_size = 64
+        self.emb_dim = 128
+        self.embedding_seq = nn.Embedding(24, self.emb_dim, padding_idx=0,device=device)
+        self.encoder_layer_seq = nn.TransformerEncoderLayer(d_model=self.emb_dim, nhead=8).to(device)
+        self.transformer_encoder_seq = nn.TransformerEncoder(self.encoder_layer_seq, num_layers=1).to(device)
+        self.conv_seq = nn.Sequential(
+            nn.Conv1d(128, 20, kernel_size=3, stride=1, padding=0),
+            nn.BatchNorm1d(20),
+            nn.Dropout(self.dropout),
+            nn.ReLU(),
+            nn.MaxPool1d(3, padding=0, dilation=1, return_indices=False, ceil_mode=False)
+        )
+        self.conv_HF = nn.Sequential(
+            nn.Conv1d(128, 20, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm1d(20),
+            nn.Dropout(self.dropout),
+            nn.ReLU(),
+            nn.MaxPool1d(1, padding=0, dilation=1, return_indices=False, ceil_mode=False)
+        )
+        self.linearlayer=nn.Linear(768,128,device=device)
+        self.relu=nn.ReLU()
+        self.gru_seq = nn.GRU(1, self.conv_hidden_dim, num_layers=2, bidirectional=True, dropout=self.dropout, batch_first=False,device=device)
+        self.attention = nn.MultiheadAttention(embed_dim=116, num_heads=4)
+        self.lstm = nn.LSTM(20, self.lstm_hidden_dim, num_layers=2, bidirectional=True, dropout=self.dropout, batch_first=False,device=device)
+
+        self.block1 = self._make_res_block(self.MLP_embed_dim, self.MLP_hidden_dim).to(device)
+        self.block2 = self._make_res_block(self.MLP_hidden_dim, self.MLP_hidden_dim).to(device)
+
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self.MLP_hidden_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(64, num_classes)
+        )
+    def _make_res_block(self, in_dim, out_dim):
+        return nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.BatchNorm1d(out_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(out_dim, out_dim),
+            nn.BatchNorm1d(out_dim),
+            nn.ReLU()
+        )
+    def forward(self, trans):
+
+        #print(output1.size())
+        #output1 = self.transformer_encoder_seq(output1)  # 输出形状 (batch, seq_len, 128)
+
+        #output2 = output2.permute(1, 0, 2)  # GRU需要 (seq_len, batch, features)
+        #self.gru_seq = nn.GRU(..., batch_first=False)  # 明确指定维度顺序
+        #output2, hn = self.gru_seq(output2.to(device))#(seq,batch,channels)(256,15,128)
+        #print(output2.size())
+        #output2=output2.permute(1,2,0)#(batch,channels,seq)
+        #output2 = output2.permute(0, 2, 1)
+        #print(output2.size())
+        #output2 = self.transformer_encoder_seq(output2)  # 输出形状 (batch, seq_len, 128)
+        output3=trans
+        output3 = self.relu(self.linearlayer(output3))
+        output3 = output3.permute(0, 2, 1)
+        output3 = self.conv_HF(output3)  # (b,c,s)
+        output3 = output3.permute(2, 0, 1)
+        output3,_ = self.lstm(output3)
+        output = output3.permute(1, 0, 2)
+
+
+        # 残差连接
+        identity = output.mean(dim=1)  # (batch, embed_dim)
+        #print(identity.size())
+        out = self.block1(output.mean(dim=1)) + identity  # (batch, hidden_dim) 残差连接&跳跃连接
+        out = self.block2(out) + out  # (batch, hidden_dim)
+        out=self.classifier(out)
+        return out, output
+'''
+        output = output.permute(2,0,1)#(seq,batch,channels)
+        output, (h,c) = self.lstm(output)
+        #print(output.size())
+        output = output.permute(1, 0, 2)#(channels,batch,seq)
+        out = self.block(output)
+'''
+
+def draw_AUC(fpr, tpr,roc_auc):
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+    plt.show()
+
+
+def pca_TSNE(features,labels,n_components=50):
+
+
+
+    # 中心化
+    mean = torch.mean(features, dim=0)
+    centered = features - mean
+    # 计算协方差矩阵
+    cov = torch.matmul(centered.T, centered) / (centered.shape[0]-1)
+    # 特征分解
+    eigvals, eigvecs = torch.linalg.eigh(cov)
+    # 取前n_components个主成分
+    components = eigvecs[:, -n_components:]
+    features_pca = torch.matmul(centered, components).cpu().detach().numpy()
+
+
+    labels = torch.tensor(labels)
+    # Step 2: t-SNE（需转CPU）
+    features = TruncatedSVD(n_components=200).fit_transform(features.detach().numpy())
+    tsne = TSNE(
+        n_components=2,
+        perplexity=45,
+        early_exaggeration=48,
+        learning_rate='auto',
+        metric='cosine',
+        n_iter=1000,
+        random_state=42
+    )
+    features_2d = tsne.fit_transform(features)
+
+    # 可视化
+    plt.figure(figsize=(10, 8))
+    plt.scatter(features_2d[:, 0], features_2d[:, 1],
+                c=labels, cmap='tab10', alpha=0.6, s=15)
+    plt.colorbar()
+    plt.title("pca_t-SNE Visualization (Direct on High-Dim Data)")
+    plt.show()
+def t_SNE(features,labels):
+
+    labels = torch.tensor(labels)
+    features=torch.tensor(features)
+    #print(features.shape)
+    features = torch.mean(features, dim=1).detach().numpy()
+    #features = TruncatedSVD(n_components=200).fit_transform(features.detach().numpy())
+
+    tsne = TSNE(
+        n_components=2,
+        perplexity=45,
+        early_exaggeration=48,
+        learning_rate='auto',
+        metric='cosine',
+        n_iter=1000,
+        random_state=42
+    )
+    features_2d = tsne.fit_transform(features)
+
+    # 可视化
+    plt.figure(figsize=(10, 8))
+    plt.scatter(features_2d[:, 0], features_2d[:, 1],
+                c=labels, cmap='tab10', alpha=0.6, s=15)
+    plt.colorbar()
+    plt.title("t-SNE Visualization (Direct on High-Dim Data)")
+    plt.show()
+def evaluate(data_iter, net,epoch):
+    pred_prob = []
+    label_pred = []
+    label_real = []
+    rep_list = []
+    true_labels = []
+    for trans, y in data_iter:
+        outputs,rep = net(trans)
+        #print(rep.shape)
+        pred_prob_positive = outputs[:, 1]
+        pred_prob = pred_prob + pred_prob_positive.tolist()
+        label_pred = label_pred + outputs.argmax(dim=1).tolist()
+        label_real = label_real + y.tolist()
+        label=y.cpu()
+        rep=rep.cpu()
+        rep_list.append(rep.detach().numpy())
+        true_labels.append(label.detach().numpy())
+    performance, roc_data, prc_data = caculate_metric(pred_prob, label_pred, label_real,epoch)
+    return performance, roc_data, prc_data,rep_list,label_real,true_labels
+def caculate_metric(pred_prob, label_pred, label_real,epoch):
+    test_num = len(label_real)
+    tp = 0
+    fp = 0
+    tn = 0
+    fn = 0
+    for index in range(test_num):
+        if label_real[index] == 1:
+            if label_real[index] == label_pred[index]:
+                tp = tp + 1
+            else:
+                fn = fn + 1
+        else:
+            if label_real[index] == label_pred[index]:
+                tn = tn + 1
+            else:
+                fp = fp + 1
+    # Accuracy
+    ACC = float(tp + tn) / test_num
+    # Sensitivity
+    if tp + fn == 0:
+        Recall = Sensitivity = 0
+    else:
+        Recall = Sensitivity = float(tp) / (tp + fn)
+    # Specificity
+    if tn + fp == 0:
+        Specificity = 0
+    else:
+        Specificity = float(tn) / (tn + fp)
+    # MCC
+    if (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn) == 0:
+        MCC = 0
+    else:
+        MCC = float(tp * tn - fp * fn) / (np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)))
+    # ROC and AUC
+    FPR, TPR, thresholds = roc_curve(label_real, pred_prob, pos_label=1)
+    AUC = auc(FPR, TPR)
+    if epoch==199:
+        draw_AUC(FPR, TPR,AUC)
+    # PRC and AP
+    precision, recall, thresholds = precision_recall_curve(label_real, pred_prob, pos_label=1)
+    AP = average_precision_score(label_real, pred_prob, average='macro', pos_label=1, sample_weight=None)
+    performance = [ACC, Sensitivity, Specificity, AUC, MCC]
+    roc_data = [FPR, TPR, AUC]
+    prc_data = [recall, precision, AP]
+    return performance, roc_data, prc_data
+def reg_loss(net, output, label):
+    criterion = nn.CrossEntropyLoss(reduction='sum')
+    criterion=criterion.to(device)
+    l2_lambda = 0.0
+    regularization_loss = 0
+    for param in net.parameters():
+        regularization_loss += torch.norm(param, p=2)
+    total_regularization_loss=l2_lambda * regularization_loss
+    total_loss = criterion(output.to(device), label.to(device)) + total_regularization_loss.to(device)
+    return total_loss
+
+
+
+def train_test(train_iter, test_iter):
+    net = Net3()
+    net=net.to(device)
+    lr = 0.002
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr,weight_decay=1e-2)
+    best_acc = 0
+    best_ind_acc = 0
+    EPOCH = 200
+    #writer=SummaryWriter("../logs_train")
+
+    for epoch in range(EPOCH):
+        loss_ls = []
+        t0 = time.time()
+        net.train()
+        for trans, label in train_iter:
+            output,_ = net(trans)
+            loss = reg_loss(net, output, label)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            loss_ls.append(loss.item())
+        #writer.add_scalar("loss",np.mean(loss_ls),epoch)
+        net.eval()
+        with torch.no_grad():
+            train_performance, train_roc_data, train_prc_data,train_rep_list,train_label_real,train_true_labels = evaluate(train_iter, net,epoch)
+            test_performance, test_roc_data, test_prc_data,test_rep_list,test_label_real,test_true_labels = evaluate(test_iter, net,epoch)
+        if(epoch==199):
+            STNE_train_rep_list = np.concatenate(train_rep_list, axis=0)
+            train_true_labels = np.concatenate(train_true_labels)
+            # pca_TSNE(STNE_rep_list,true_labels)
+            t_SNE(STNE_train_rep_list, train_true_labels)
+
+            STNE_test_rep_list=np.concatenate(test_rep_list,axis=0)
+            test_true_labels=np.concatenate(test_true_labels)
+            #pca_TSNE(STNE_rep_list,true_labels)
+            t_SNE(STNE_test_rep_list,test_true_labels)
+        #writer.add_scalar("test_loss", np.mean(test_loss_ls), epoch)
+        results = f"\nepoch: {epoch + 1}, loss: {np.mean(loss_ls):.5f}\n"
+        results += f'train_acc: {train_performance[0]:.4f}, time: {time.time() - t0:.2f}'
+        results += '\n' + '=' * 16 + ' Test Performance. Epoch[{}] '.format(epoch + 1) + '=' * 16 \
+                   + '\n[ACC,\tSP,\t\tSE,\t\tAUC,\tMCC]\n' + '{:.4f},\t{:.4f},\t{:.4f},\t{:.4f},\t{:.4f}'.format(
+            test_performance[0], test_performance[2], test_performance[1], test_performance[3],
+            test_performance[4])
+        print(results)
+        #print(ind_performance)
+        test_acc = test_performance[0]  # test_performance: [ACC, Sensitivity, Specificity, AUC, MCC]
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_performance = test_performance
+            filename = '{}, {}[{:.4f}].pt'.format('H_A_Model' + ', epoch[{}]'.format(epoch + 1), 'ACC', best_acc)
+            save_path_pt = os.path.join('file', filename)
+            #torch.save(net.state_dict(), save_path_pt, _use_new_zipfile_serialization=False)
+            best_results = '\n' + '=' * 16 + colored(' Best Performance. Epoch[{}] ', 'red').format(
+                epoch + 1) + '=' * 16 \
+                           + '\n[ACC,\tSP,\t\tSE,\t\tAUC,\tMCC]\n' + '{:.4f},\t{:.4f},\t{:.4f},\t{:.4f},\t{:.4f}'.format(
+                best_performance[0], best_performance[2], best_performance[1], best_performance[3],
+                best_performance[4]) + '\n' + '=' * 60
+            # print(best_results)
+            best_ROC = test_roc_data
+            best_PRC = test_prc_data
+        if epoch==199:
+            torch.save(net,"trans.pth".format(epoch+1))
+    #writer.close()
+    return best_performance, best_results, best_ROC, best_PRC
+
+
+
+def K_CV(file, ind_iter, k):
+    tmp = pd.read_csv(file, header=None)
+    seqs, labels = np.array(tmp[0].values.tolist()), np.array(tmp[1].values.tolist())
+    data_iter = data_construct(seqs, labels, train=True)
+    data_iter = list(data_iter)
+    CV_perform = []
+
+    for iter_k in range(k):
+        print("\n" + "=" * 16 + "k = " + str(iter_k + 1) + "=" * 16)
+        train_iter = [x for i, x in enumerate(data_iter) if i % k != iter_k]
+        test_iter = [x for i, x in enumerate(data_iter) if i % k == iter_k]
+        performance, _, ROC, PRC = train_test(train_iter, test_iter, ind_iter)
+        print(performance)
+        CV_perform.append(performance)
+    print('\n' + '=' * 16 + colored(' Cross-Validation Performance ',
+                                    'red') + '=' * 16 + '\n[ACC,\tSP,\t\tSE,\t\tAUC,\tMCC]\n')
+    for out in np.array(CV_perform):
+        print('{:.4f},\t{:.4f},\t{:.4f},\t{:.4f},\t{:.4f}'.format(out[0], out[2], out[1], out[3], out[4]))
+    mean_out = np.array(CV_perform).mean(axis=0)
+    print('\n' + '=' * 16 + "Mean out" + '=' * 16)
+    print('{:.4f},\t{:.4f},\t{:.4f},\t{:.4f},\t{:.4f}'.format(mean_out[0], mean_out[2], mean_out[1], mean_out[3],
+                                                              mean_out[4]))
+    print('\n' + '=' * 60)
+def load_model(new_model, path_pretrain_model):
+    pretrained_dict = torch.load(path_pretrain_model, map_location=torch.device('cpu'))
+    new_model_dict = new_model.state_dict()
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in new_model_dict}
+    new_model_dict.update(pretrained_dict)
+    new_model.load_state_dict(new_model_dict)
+    return new_model
+
+
+
+if __name__ == '__main__':
+    train_iter = load_bench_data("Train.csv")
+    ind_iter = load_Ind_data('Ind.csv')
+    performance, result_bench,roc_data,prc_data = train_test(train_iter, ind_iter)
+
+    #print(train_iter.shape)
+    #test_iter = load_ind_data("test.csv")
+    #print(test_iter.shape)
