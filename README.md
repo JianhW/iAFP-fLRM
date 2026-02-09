@@ -4,8 +4,8 @@
 ## 📄 Paper
 
 > **[iAFP-fLRM: Accurate identification of antifungal peptides via hybrid deep learning architecture and multi-modal feature fusion](https://doi.org/10.1016/j.bpc.2026.107591)**  
-> *Biophysical Chemistry*, 2026
-> *Authors*: Shengli Zhang, Jianwei Cheng, Guixu Zhou, Jianhua Wang
+> *Biophysical Chemistry*, 2026  
+> *Authors*: Shengli Zhang, Jianwei Cheng, Guixu Zhou, Jianhua Wang  
 
 ## 🏗 Model Architecture
 
